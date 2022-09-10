@@ -192,7 +192,9 @@ class InferenceThead(threading.Thread):
     def setProgress(self, progress: InferenceProgerss):
         self.__progress = progress
 
-    def putInputs(self, inputs):
+    def putInputs(self, inputs: list):
+        if len(inputs) == 0:
+            return
         for i, img in enumerate(inputs):
             img = torch.from_numpy(img / 255.).permute(2, 0, 1).float()
             inputs[i] = img.unsqueeze(0)
