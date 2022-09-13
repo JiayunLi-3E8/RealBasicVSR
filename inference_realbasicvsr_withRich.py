@@ -79,13 +79,21 @@ def init_model(config, checkpoint=None):
 
 
 class InferenceProgerss:
-    def __init__(self, total, split):
+    def __init__(self, imageTotal, split, maxSeqLen):
+        self.__maxSeqLen = maxSeqLen
         self.__progress = Progress()
+        self.__taskLoad = self.__progress.add_task(
+            "[green]Preload: ", total=maxSeqLen)
         self.__taskSplit = self.__progress.add_task(
-            "[cyan]Infer in split: ", total=split*split)
+            "[yellow]Infer in split: ", total=split*split)
+        self.__taskOutput = self.__progress.add_task(
+            "[red]Output: ", total=maxSeqLen, visible=False)
         self.__taskInfer = self.__progress.add_task(
-            "[green]Inferring...", total=total*split*split)
+            "[cyan]Inferring...", total=imageTotal*split*split)
         self.__progress.start()
+
+    def __del__(self):
+        self.__progress.stop()
 
     def inferAdvance(self, advance):
         self.__progress.advance(self.__taskInfer, advance)
@@ -96,12 +104,34 @@ class InferenceProgerss:
     def splitReset(self):
         self.__progress.reset(self.__taskSplit)
 
+    def preloadAdvance(self):
+        self.__progress.advance(self.__taskLoad)
+
+    def preloadComplete(self):
+        self.__progress.update(self.__taskLoad, completed=self.__maxSeqLen)
+
+    def preloadReset(self):
+        self.__progress.reset(self.__taskLoad, visible=True)
+
+    def preloadHide(self):
+        self.__progress.update(self.__taskLoad, visible=False)
+
+    def outputAdvance(self):
+        self.__progress.advance(self.__taskOutput)
+
+    def outputReset(self, total=None):
+        self.__progress.reset(self.__taskOutput, total=total, visible=True)
+
+    def outputHide(self):
+        self.__progress.update(self.__taskOutput, visible=False)
+
 
 class OutputThead(threading.Thread):
     def __init__(self, outputDir, inferenceThead, inputHandles, inputIsVideo, fpsIfOutV=25, saveAsPng=False):
         threading.Thread.__init__(self)
         self.__outputQueue = queue.Queue()
         self.__keep = True
+        self.__progress = None
         self.__inputHandles = inputHandles
         self.__inputIsVideo = inputIsVideo
         self.__saveAsPng = saveAsPng
@@ -140,10 +170,14 @@ class OutputThead(threading.Thread):
                 time.sleep(0.1)
             else:
                 outputs = self.__outputQueue.get()
+                if self.__progress is not None:
+                    self.__progress.outputReset(outputs.size(1))
                 if self.__outputIsVideo:
                     for i in range(0, outputs.size(1)):
                         img = tensor2img(outputs[:, i, :, :, :])
                         self.__video_writer.write(img.astype(np.uint8))
+                        if self.__progress is not None:
+                            self.__progress.outputAdvance()
                     del img
                 else:
                     for i in range(0, outputs.size(1)):
@@ -158,9 +192,16 @@ class OutputThead(threading.Thread):
                             file_extension = os.path.splitext(filename)[1]
                             filename = filename.replace(file_extension, '.png')
                         mmcv.imwrite(output, f'{self.__outputDir}/{filename}')
+                        if self.__progress is not None:
+                            self.__progress.outputAdvance()
                     del output
                 self.__outputQueue.task_done()
                 del outputs
+                if self.__progress is not None:
+                    self.__progress.outputHide()
+
+    def setProgress(self, progress: InferenceProgerss):
+        self.__progress = progress
 
     def end(self):
         self.__outputQueue.join()
@@ -199,6 +240,8 @@ class InferenceThead(threading.Thread):
             img = torch.from_numpy(img / 255.).permute(2, 0, 1).float()
             inputs[i] = img.unsqueeze(0)
         inputs = torch.stack(inputs, dim=1)
+        if self.__progress is not None:
+            self.__progress.preloadComplete()
 
         while self.__ready:
             time.sleep(0.001)
@@ -264,29 +307,29 @@ def main():
     # initialize the model
     model = init_model(args.config, args.checkpoint)
 
-    inputTotal = inputHandles.frame_cnt if isVideo else len(inputHandles)
-    progress = InferenceProgerss(inputTotal, args.split)
     inferenceThead = InferenceThead(model, args.split)
     outputThead = OutputThead(args.output_dir, inferenceThead,
                               inputHandles, isVideo, args.fps, args.save_as_png)
     inferenceThead.setOutputThead(outputThead)
+    imageTotal = inputHandles.frame_cnt if isVideo else len(inputHandles)
+    progress = InferenceProgerss(imageTotal, args.split, args.max_seq_len)
     inferenceThead.setProgress(progress)
+    outputThead.setProgress(progress)
     inferenceThead.start()
     outputThead.start()
     inputs = []
-    if isVideo:
-        for frame in inputHandles:
-            inputs.append(np.flip(frame, axis=2))
-            if len(inputs) >= args.max_seq_len:
-                inferenceThead.putInputs(inputs)
-                inputs = []
-    else:
-        for input_path in inputHandles:
-            inputs.append(mmcv.imread(input_path, channel_order='rgb'))
-            if len(inputs) >= args.max_seq_len:
-                inferenceThead.putInputs(inputs)
-                inputs = []
+    for inputHandle in inputHandles:
+        if isVideo:
+            inputs.append(np.flip(inputHandle, axis=2))
+        else:
+            inputs.append(mmcv.imread(inputHandle, channel_order='rgb'))
+        progress.preloadAdvance()
+        if len(inputs) >= args.max_seq_len:
+            inferenceThead.putInputs(inputs)
+            inputs = []
+            progress.preloadReset()
     inferenceThead.putInputs(inputs)
+    progress.preloadHide()
     inferenceThead.end()
     inferenceThead.join()
     outputThead.end()
